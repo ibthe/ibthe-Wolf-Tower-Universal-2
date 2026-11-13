@@ -1,0 +1,115 @@
+package com.wolftower.app
+
+import android.content.Context
+
+/** Простое хранилище выбора пользователя. */
+object Settings {
+    private fun prefs(ctx: Context) = ctx.getSharedPreferences("dpi", Context.MODE_PRIVATE)
+
+    /** Выбранный язык интерфейса (ru, en, ce) или null, пока пользователь не выбирал: тогда берётся язык системы. */
+    fun language(ctx: Context): String? = prefs(ctx).getString("lang", null)
+
+    fun setLanguage(ctx: Context, code: String) {
+        prefs(ctx).edit().putString("lang", code).apply()
+    }
+
+    private const val KEY_ENABLED = "enabled_services"
+
+    /** Пока пользователь ничего не выбирал, включены оба сервиса. */
+    private val DEFAULT_ENABLED = setOf("youtube", "instagram")
+
+    /** Включённые сервисы (id из profiles.json). Пустой набор допустим: тогда запускать нечего. */
+    fun enabledIds(ctx: Context): Set<String> {
+        val raw = prefs(ctx).getString(KEY_ENABLED, null) ?: return DEFAULT_ENABLED
+        return raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+    }
+
+    fun setEnabled(ctx: Context, id: String, on: Boolean) {
+        val next = if (on) enabledIds(ctx) + id else enabledIds(ctx) - id
+        prefs(ctx).edit().putString(KEY_ENABLED, next.sorted().joinToString(",")).apply()
+    }
+
+    /**
+     * Стратегия сервиса для ТЕКУЩЕЙ сети: сначала то, что запомнено для этой сети, затем общий выбор.
+     * "none" = без обхода.
+     */
+    fun strategyFor(ctx: Context, profile: Profile): String {
+        val p = prefs(ctx)
+        val fp = NetId.fingerprint(ctx)
+        val saved = p.getString("net_${fp}_${profile.id}", null)
+            ?: p.getString("strategy_${profile.id}", null)
+            ?: profile.defaultStrategy
+        // Не запускаем неизвестные/устаревшие сохранённые имена с пустым набором аргументов.
+        // Не применяем к WhatsApp стратегии, которые меняют только TLS SNI: его чат использует Noise без SNI.
+        val allowedForProfile = profile.strategyOptions.isEmpty() || saved in profile.strategyOptions || saved.startsWith(StrategyArgs.RAW_PREFIX)
+        return if (!StrategyArgs.isSupported(saved) || !allowedForProfile) profile.defaultStrategy else saved
+    }
+
+    /** Запоминает выбор и как общий, и для текущей сети. */
+    fun setStrategyFor(ctx: Context, profileId: String, strategy: String) {
+        val fp = NetId.fingerprint(ctx)
+        prefs(ctx).edit()
+            .putString("strategy_$profileId", strategy)
+            .putString("net_${fp}_$profileId", strategy)
+            .apply()
+    }
+
+    /**
+     * Блокировка QUIC (UDP): переключателя в интерфейсе нет. Всегда "авто" (null): QUIC блокируется, когда
+     * его хотят все включённые сервисы (у YouTube и Instagram block_quic=true), и приложения откатываются на TCP,
+     * где работают приёмы обхода. Старые сохранённые значения игнорируются.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun blockQuicPref(ctx: Context): Boolean? = null
+
+    /**
+     * Защищённый DNS (DoH-переходник перед ByeDPI) включён по умолчанию: без него ByeDPI определяет адреса через DNS
+     * оператора, который режет или подменяет ответы для api-хостов (i.instagram.com, graph.facebook.com,
+     * graph.whatsapp.com): лента открывается, а комментарии и статусы нет. Ключ новый, старые значения игнорируются.
+     */
+    fun dohEnabled(ctx: Context): Boolean = prefs(ctx).getBoolean("doh2", true)
+
+    fun setDoh(ctx: Context, value: Boolean) = prefs(ctx).edit().putBoolean("doh2", value).apply()
+
+    /** Найденный автоподбором путь: стратегия, число открывшихся адресов, задержка (мс) и скорость (КБ/с). */
+    data class RankEntry(val strategy: String, val ok: Int, val total: Int, val latencyMs: Int, val kbps: Int)
+
+    /** Итог последнего подбора для сервиса, лучший путь первым (пусто, если подбора ещё не было). */
+    fun rankingFor(ctx: Context, profileId: String): List<RankEntry> {
+        val raw = prefs(ctx).getString("rank_$profileId", null) ?: return emptyList()
+        return raw.split(';').mapNotNull { item ->
+            val f = item.split('|')
+            if (f.size != 5) return@mapNotNull null
+            val ok = f[1].toIntOrNull() ?: return@mapNotNull null
+            val total = f[2].toIntOrNull() ?: return@mapNotNull null
+            RankEntry(f[0], ok, total, f[3].toIntOrNull() ?: 0, f[4].toIntOrNull() ?: 0)
+        }
+    }
+
+    fun setRankingFor(ctx: Context, profileId: String, list: List<RankEntry>) {
+        val raw = list.joinToString(";") { "${it.strategy}|${it.ok}|${it.total}|${it.latencyMs}|${it.kbps}" }
+        prefs(ctx).edit().putString("rank_$profileId", raw).apply()
+    }
+
+    fun notifAsked(ctx: Context): Boolean = prefs(ctx).getBoolean("notif_asked", false)
+
+    fun setNotifAsked(ctx: Context) = prefs(ctx).edit().putBoolean("notif_asked", true).apply()
+
+    /** Идентификаторы способов обхода на базе sing-box. */
+    const val ENGINE_SB_FRAGMENT = "sb_fragment"
+    const val ENGINE_SB_WARP = "sb_warp"
+
+    /** DNS для sing-box: "cloudflare" (по умолчанию), "google" или "system". */
+    fun sbDns(ctx: Context): String = prefs(ctx).getString("sb_dns", "cloudflare") ?: "cloudflare"
+
+    fun setSbDns(ctx: Context, value: String) {
+        prefs(ctx).edit().putString("sb_dns", value).apply()
+    }
+
+    /** Сохранённый аккаунт WARP в виде JSON (см. WarpAccount.toJson) или null, пока он не создан. */
+    fun warpAccount(ctx: Context): String? = prefs(ctx).getString("warp_account", null)
+
+    fun setWarpAccount(ctx: Context, json: String) {
+        prefs(ctx).edit().putString("warp_account", json).apply()
+    }
+}

@@ -1,0 +1,771 @@
+// Проверки логики без Electron: node test/run.js
+const assert = require('assert');
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
+const net = require('net');
+const os = require('os');
+const path = require('path');
+const vm = require('vm');
+const { execFileSync } = require('child_process');
+
+const { buildGroups, loadConfig, forName, parseRaw, enabledIds, supported, BASE } = require('../src/profiles');
+const { buildPac, PacServer } = require('../src/pac');
+const { Store } = require('../src/store');
+const { License } = require('../src/license');
+const { probeHost } = require('../src/probe');
+const { chooseBest } = require('../src/autoprobe');
+const { Engine, ByeDpi, freePort } = require('../src/engine');
+const autoprobeMod = require('../src/autoprobe');
+const { DohSocks, parseDohAnswer, resolve4 } = require('../src/dohsocks');
+
+let passed = 0;
+const results = [];
+async function test(name, fn) {
+  try {
+    await fn();
+    passed++;
+    results.push('OK   ' + name);
+  } catch (e) {
+    results.push('FAIL ' + name + ' :: ' + (e && e.message));
+    process.exitCode = 1;
+  }
+}
+
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wt-test-'));
+const root = path.join(__dirname, '..', '..');
+const config = loadConfig([path.join(root, 'profiles', 'profiles.json')]);
+
+(async () => {
+  await test('профили и стратегии загружаются, по умолчанию split+disorder', () => {
+    assert.deepStrictEqual(config.profiles.map((p) => p.id), ['youtube', 'instagram', 'whatsapp']);
+    assert.strictEqual(config.defaultStrategy, 'split+disorder');
+    assert.deepStrictEqual(forName('split+disorder'), ['-s1+s', '-d3+s']);
+    assert.deepStrictEqual(forName('fake+oob'), ['-f-1', '-t', '8', '-o1+s']);
+    assert.deepStrictEqual(forName('none'), []);
+    assert.deepStrictEqual(BASE, ['-X']);
+    const wa = config.profiles.find((p) => p.id === 'whatsapp');
+    assert.deepStrictEqual(wa.strategyOptions, ['disorder0', 'split0', 'chain']);
+    assert.strictEqual(wa.defaultStrategy, 'disorder0');
+  });
+
+  await test('профили: оба сервиса по SNI, QUIC блокируется, у YouTube порог скорости пробы', () => {
+    const [yt, ig, wa] = config.profiles;
+    for (const p of [yt, ig]) {
+      assert.strictEqual(p.matchAll, false);
+      assert.strictEqual(p.blockQuic, true);
+      assert(p.domains.length && p.probeHosts.length >= 3);
+    }
+    assert(yt.domains.includes('googlevideo.com') && ig.domains.includes('cdninstagram.com'));
+    assert.strictEqual(yt.probeMinBytes, 100000);
+    assert.strictEqual(yt.probeBudgetMs, 4000);
+    assert.strictEqual(ig.probeMinBytes, 40000);
+    assert.strictEqual(ig.probeBudgetMs, 0);
+    assert.strictEqual(wa.matchAll, true);
+    assert.strictEqual(wa.defaultEnabled, false);
+    assert.strictEqual(wa.defaultStrategy, 'disorder0');
+    assert.deepStrictEqual(wa.strategyOptions, ['disorder0', 'split0', 'chain']);
+    assert.deepStrictEqual(wa.probeHosts, ['web.whatsapp.com', 'www.whatsapp.com', 'static.whatsapp.net']);
+  });
+
+  await test('macOS: стратегии с fake/ttl/sack недоступны, остальные работают', () => {
+    const bad = config.strategies.filter((n) => !supported(n, 'darwin'));
+    assert(bad.includes('fake+disorder') && bad.includes('oob-sack') && bad.includes('chain-fake'));
+    assert(supported('split+disorder', 'darwin') && supported('chain', 'darwin') && supported('disorder', 'darwin'));
+    assert(supported('none', 'darwin'));
+    assert.strictEqual(supported('not-a-real-strategy', 'linux'), false);
+    assert.strictEqual(supported('not-a-real-strategy', 'darwin'), false);
+    assert.strictEqual(supported('raw:-f-1 -t 8 -d1', 'darwin'), false);
+    assert.strictEqual(supported('raw:-d1 -s1+s -a1', 'darwin'), true);
+    assert(config.strategies.every((n) => supported(n, 'linux') && supported(n, 'win32')));
+    assert(config.strategies.filter((n) => supported(n, 'darwin')).length >= 15, 'на macOS остаётся достаточно вариантов');
+  });
+
+  await test('подбор: причина неудачного запуска ByeDPI попадает в сообщение об ошибке', async () => {
+    const { score } = require('../src/autoprobe');
+    await assert.rejects(
+      score({ makeProcess: () => ({ start: async () => false, lastError: 'не найден файл ciadpi', stop: async () => {} }),
+        freePort: async () => 1, forName: () => [], profiles: config.profiles, candidates: ['none'], isCancelled: () => false, onProgress() {} }),
+      /не удалось запустить ByeDPI: не найден файл ciadpi/);
+  });
+
+  await test('включённые сервисы: по умолчанию оба, затем выбор пользователя', () => {
+    const st = new Store(path.join(tmp, 'en'));
+    assert.deepStrictEqual(enabledIds(config, st), ['youtube', 'instagram']);
+    st.set('enabled', ['instagram', 'whatsapp']);
+    assert.deepStrictEqual(enabledIds(config, st), ['instagram', 'whatsapp']);
+    st.set('enabled', []);
+    assert.deepStrictEqual(enabledIds(config, st), []);
+  });
+
+  await test('WhatsApp: сохранённая TLS/SNI-стратегия заменяется на совместимую с Noise', () => {
+    const st = new Store(path.join(tmp, 'wa-strategy'));
+    st.set('enabled', ['whatsapp']);
+    st.set('strategy_whatsapp', 'disorder');
+    const engine = new Engine({ resourcesDir: path.join(tmp, 'missing-resources'), store: st, config });
+    assert.strictEqual(engine.selection()[0].strategy, 'disorder0');
+    st.set('strategy_whatsapp', 'chain');
+    assert.strictEqual(engine.selection()[0].strategy, 'chain');
+  });
+
+  await test('переводы: у каждого ключа есть английский и чеченский, подстановки совпадают', () => {
+    const dict = JSON.parse(fs.readFileSync(path.join(root, 'i18n', 'translations.json'), 'utf8'));
+    const ph = (t) => (t.match(/\{\d+\}/g) || []).sort().join();
+    for (const [k, v] of Object.entries(dict)) {
+      assert(v.en && v.ce, 'нет перевода: ' + k);
+      assert.strictEqual(ph(v.en), ph(k), 'подстановки en: ' + k);
+      assert.strictEqual(ph(v.ce), ph(k), 'подстановки ce: ' + k);
+    }
+    assert(Object.keys(dict).length > 100);
+  });
+
+  await test('переводы: все строки tr()/trf() из Android, компьютера и HTML есть в словаре', () => {
+    const dict = JSON.parse(fs.readFileSync(path.join(root, 'i18n', 'translations.json'), 'utf8'));
+    const files = [];
+    const walk = (d) => {
+      for (const f of fs.readdirSync(d, { withFileTypes: true })) {
+        const full = path.join(d, f.name);
+        if (f.isDirectory()) { if (!['node_modules', 'dist', 'test', 'build'].includes(f.name)) walk(full); }
+        else if (/\.(kt|js|html)$/.test(f.name)) files.push(full);
+      }
+    };
+    walk(path.join(root, 'android', 'app', 'src', 'main', 'java'));
+    walk(path.join(root, 'desktop', 'renderer'));
+    walk(path.join(root, 'desktop', 'src'));
+    files.push(path.join(root, 'desktop', 'main.js'));
+    const unesc = (t) => t.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\'/g, "'");
+    const cyr = /[А-Яа-яЁё]/;
+    const missing = new Set();
+    let used = 0;
+    for (const f of files) {
+      const src = fs.readFileSync(f, 'utf8');
+      const keys = [];
+      for (const m of src.matchAll(/\btrf?\(\s*(["'`])((?:\\.|(?!\1)[^\\])*)\1/g)) keys.push(unesc(m[2]));
+      for (const m of src.matchAll(/data-i18n(?:-ph|-aria)?="([^"]+)"/g)) keys.push(m[1]);
+      if (f.endsWith('.html')) for (const m of src.matchAll(/<[^>]*\bdata-i18n(?![-\w])[^>]*>([^<]+)</g)) keys.push(m[1].trim().replace(/\s+/g, ' '));
+      for (const m of src.matchAll(/plural\([^,]+,\s*'([^']+)',\s*'([^']+)',\s*'([^']+)'/g)) keys.push(m[1], m[2], m[3]);
+      for (const m of src.matchAll(/I18n\.plural\([^,]+,\s*"([^"]+)",\s*"([^"]+)",\s*"([^"]+)"/g)) keys.push(m[1], m[2], m[3]);
+      for (const k of keys) { if (cyr.test(k)) { used++; if (!dict[k]) missing.add(path.basename(f) + ': ' + k); } }
+    }
+    for (const k of ['{0} идёт через обход. Сеть: {1}', '{0} идут через обход. Сеть: {1}', '{0} идёт через обход', '{0} идут через обход']) assert(dict[k], k);
+    assert(used > 80, 'нашлось слишком мало строк: ' + used);
+    assert.deepStrictEqual([...missing], [], 'нет в словаре:\n' + [...missing].join('\n'));
+  });
+
+  await test('переводы: tr/trf/plural на трёх языках', () => {
+    const i18n = require('../src/i18n');
+    assert(i18n.load([path.join(root, 'i18n', 'translations.json')]));
+    i18n.setLang('ru');
+    assert.strictEqual(i18n.tr('Сервисы'), 'Сервисы');
+    assert.strictEqual(i18n.trf('Осталось {0}', '5 дней'), 'Осталось 5 дней');
+    assert.strictEqual(i18n.plural(5, 'день', 'дня', 'дней'), 'дней');
+    i18n.setLang('en');
+    assert.strictEqual(i18n.tr('Сервисы'), 'Services');
+    assert.strictEqual(i18n.trf('Осталось {0}', 3), '3 left');
+    assert.strictEqual(i18n.plural(1, 'день', 'дня', 'дней'), 'day');
+    assert.strictEqual(i18n.plural(5, 'день', 'дня', 'дней'), 'days');
+    assert.strictEqual(i18n.tr('нет такого ключа'), 'нет такого ключа');
+    i18n.setLang('ce');
+    assert.strictEqual(i18n.tr('Сервисы'), 'Сервисаш');
+    assert.strictEqual(i18n.plural(5, 'день', 'дня', 'дней'), 'де');
+    assert.strictEqual(Object.keys(i18n.table()).length > 100, true);
+    i18n.setLang('xx');
+    assert.strictEqual(i18n.getLang(), 'ce', 'неизвестный язык игнорируется');
+    assert.deepStrictEqual([i18n.fromLocale('ru-RU'), i18n.fromLocale('ce'), i18n.fromLocale('de-DE'), i18n.fromLocale('')], ['ru', 'ce', 'en', 'en']);
+    i18n.setLang('ru');
+  });
+
+  await test('лицензия: сообщения переводятся вслед за языком', () => {
+    const i18n = require('../src/i18n');
+    i18n.setLang('en');
+    const { License } = require('../src/license');
+    const lic = new License({ store: new Store(path.join(tmp, 'li18n')), publicKeyB64: '', machineId: 'x' });
+    assert.strictEqual(lic.verifyKey('bad').reason, 'Invalid key format');
+    assert.strictEqual(lic.describe({ kind: 'not_activated' }), 'The app is not activated. Enter a license or trial key.');
+    i18n.setLang('ru');
+    assert.strictEqual(lic.verifyKey('bad').reason, 'Неверный формат ключа');
+  });
+
+  await test('группы ByeDPI: hosts на сервис, между группами --auto=none', () => {
+    const [yt, ig] = config.profiles;
+    const out = buildGroups([
+      { profile: yt, strategy: 'split+disorder' },
+      { profile: ig, strategy: 'disorder' },
+    ]);
+    assert.strictEqual(out[0], '--hosts');
+    assert(out[1].startsWith(':youtube.com') && out[1].includes('googlevideo.com'));
+    assert.deepStrictEqual(out.slice(2, 5), ['-s1+s', '-d3+s', '--auto=none']);
+    assert.strictEqual(out[5], '--hosts');
+    assert(out[6].startsWith(':instagram.com'));
+    assert.strictEqual(out[7], '-d1+s');
+    // none не попадает в аргументы
+    const one = buildGroups([{ profile: yt, strategy: 'none' }, { profile: ig, strategy: 'split' }]);
+    assert(!one.join(' ').includes('youtube.com'));
+  });
+
+  await test('строка в стиле ByeByeDPI: разрешены флаги обхода, опасные отклоняются', () => {
+    const s = '-d1 -s1+s -s3+s -s6+s -s9+s -s12+s -s15+s -s20+s -s30+s -a1';
+    assert.deepStrictEqual(forName('raw:' + s), s.split(' '));
+    assert.deepStrictEqual(forName('chain+udp'), s.split(' '));
+    assert.deepStrictEqual(parseRaw('-f -1 -t 8 -d1+s'), ['-f', '-1', '-t', '8', '-d1+s']);
+    for (const bad of ['-i 0.0.0.0', '-X', '-p 80', '--hosts :a.com', '-H :a.com', '-A t', '-U', '-D', '-x 2', '', '-d1 -c 9']) {
+      assert.strictEqual(parseRaw(bad), null, bad);
+    }
+    assert.deepStrictEqual(forName('raw:-D'), []);
+  });
+
+  await test('все стратегии из profiles.json известны и не содержат управляющих флагов', () => {
+    for (const name of config.strategies) {
+      const args = forName(name);
+      assert(args.length > 0, name);
+      assert.notStrictEqual(parseRaw(args.join(' ')), null, name);
+    }
+  });
+
+  await test('PAC: только домены выбранных сервисов идут через прокси', () => {
+    const pac = buildPac(['youtube.com', 'bad domain;"'], 18080);
+    assert(!pac.includes('bad domain'), 'мусорные домены отбрасываются');
+    const ctx = { dnsDomainIs: (h, d) => h.endsWith(d) };
+    vm.runInNewContext(pac, ctx);
+    assert(ctx.FindProxyForURL('http://www.youtube.com/', 'www.youtube.com').startsWith('SOCKS5 127.0.0.1:18080'));
+    assert(ctx.FindProxyForURL('http://youtube.com/', 'YouTube.com').startsWith('SOCKS5'));
+    assert.strictEqual(ctx.FindProxyForURL('http://example.com/', 'example.com'), 'DIRECT');
+    assert.strictEqual(ctx.FindProxyForURL('http://notyoutube.com/', 'notyoutube.com'), 'DIRECT');
+    const empty = {};
+    empty.dnsDomainIs = ctx.dnsDomainIs;
+    vm.runInNewContext(buildPac([], 0), empty);
+    assert.strictEqual(empty.FindProxyForURL('http://youtube.com/', 'youtube.com'), 'DIRECT');
+  });
+
+  await test('PAC-сервер отдаёт актуальный файл', async () => {
+    const s = new PacServer();
+    await s.start();
+    s.update(['youtube.com'], 1234);
+    const body = await new Promise((resolve) =>
+      http.get(s.url, (r) => {
+        let d = '';
+        r.on('data', (c) => (d += c));
+        r.on('end', () => resolve({ d, type: r.headers['content-type'] }));
+      })
+    );
+    assert(body.d.includes('127.0.0.1:1234'));
+    assert.strictEqual(body.type, 'application/x-ns-proxy-autoconfig');
+    await s.stop();
+  });
+
+  // ---------------- лицензии: ключи выпускает настоящий keygen (Python), проверяет Node
+  const lic = {};
+  try {
+    const keysDir = path.join(tmp, 'keys');
+    fs.mkdirSync(keysDir);
+    const env = { ...process.env, WT_KEYS_DIR: keysDir, WT_PRIVATE_KEY: path.join(keysDir, 'private_key.pem') };
+    const kg = path.join(root, 'tools', 'license', 'keygen.py');
+    const py = (...a) => execFileSync('python3', [kg, ...a], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    lic.pub = py('init').split('\n').pop().trim();
+    lic.any = py('issue', '--days', '30', '--any-device');
+    lic.perp = py('issue', '--perpetual', '--any-device');
+    lic.dev = py('issue', '--trial', '--device', 'ABCD-EF01-2345');
+    lic.other = py('issue', '--days', '30', '--device', 'ABCD-EF01-2345');
+  } catch (e) {
+    lic.error = e.message;
+  }
+  const mk = (extra = {}) =>
+    new License({ store: new Store(fs.mkdtempSync(path.join(tmp, 's-'))), publicKeyB64: lic.pub, machineId: 'test-machine', skewFn: async () => 0, ...extra });
+
+  await test('лицензия: ключ из Python проверяется в Node', () => {
+    assert(!lic.error, lic.error);
+    const l = mk();
+    assert(l.verifyKey(lic.any).ok);
+    assert(l.verifyKey(lic.perp).ok);
+    assert.strictEqual(l.verifyKey(lic.perp).untilMs, null);
+  });
+
+  await test('лицензия: подделка, чужой формат, чужое устройство', () => {
+    const l = mk();
+    const parts = lic.any.split('.');
+    const forged = `${parts[0]}.${parts[1].slice(0, -2)}AA.${parts[2]}`;
+    assert(!l.verifyKey(forged).ok);
+    assert(!l.verifyKey('мусор').ok);
+    assert(!l.verifyKey(lic.dev).ok, 'ключ для другого устройства не должен подойти');
+    assert(/другого устройства/.test(l.verifyKey(lic.dev).reason));
+  });
+
+  await test('лицензия: привязка к устройству совпадает с форматом Android', () => {
+    const l = mk();
+    assert(/^[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}$/.test(l.deviceId));
+  });
+
+  await test('лицензия: активация, статус, срок, откат часов', async () => {
+    const t0 = Date.now();
+    let now = t0;
+    const l = mk({ now: () => now });
+    assert.strictEqual(l.status().kind, 'not_activated');
+    assert.strictEqual(await l.activate('мусор'), 'Неверный формат ключа');
+    assert(/проверку подписи/.test(await l.activate('WT1.xxx.yyy')));
+    assert.strictEqual(await l.activate(lic.any), null);
+    assert.strictEqual(l.status().kind, 'licensed');
+    now = t0 + 40 * 86400000; // ключ на 30 дней уже истёк
+    assert.strictEqual(l.status().kind, 'expired');
+    now = t0 - 3 * 86400000; // откат на 3 дня назад
+    assert.strictEqual(l.status().kind, 'tampered');
+    // бессрочный ключ работает независимо от отката
+    const l2 = mk({ now: () => now });
+    assert.strictEqual(await l2.activate(lic.perp), null);
+    assert.strictEqual(l2.status().kind, 'licensed');
+  });
+
+  await test('лицензия: сверка с сетью деактивирует ключ при отставании часов', async () => {
+    const store = new Store(fs.mkdtempSync(path.join(tmp, 's-')));
+    let skew = 0;
+    const l = new License({ store, publicKeyB64: lic.pub, machineId: 'm', skewFn: async () => skew });
+    assert.strictEqual(await l.activate(lic.any), null);
+    skew = -2 * 3600 * 1000; // компьютер отстаёт на 2 часа
+    assert.strictEqual(await l.networkCheck(), 'BEHIND');
+    assert.strictEqual(l.status().kind, 'tampered');
+    assert(/отстаёт/.test(await l.activate(lic.any)));
+    skew = null; // сети нет: ключ ввести нельзя, пока флаг нарушения не снят
+    assert(/Нужен интернет/.test(await l.activate(lic.any)));
+    skew = 5000; // часы в норме, флаг снимается
+    assert.strictEqual(await l.networkCheck(), 'OK');
+    assert.strictEqual(await l.activate(lic.any), null);
+    assert.strictEqual(l.status().kind, 'licensed');
+    skew = 3 * 3600 * 1000; // часы спешат: ключ не трогаем
+    assert.strictEqual(await l.networkCheck(), 'OK');
+    assert.strictEqual(l.status().kind, 'licensed');
+  });
+
+  await test('автоподбор: максимум успехов, при равенстве более ранний', () => {
+    const cands = ['none', 'disorder', 'oob'];
+    assert.deepStrictEqual(chooseBest({ none: 2, disorder: 2, oob: 1 }, cands), { best: 'none', ok: 2 });
+    assert.deepStrictEqual(chooseBest({ disorder: 1, oob: 3 }, cands), { best: 'oob', ok: 3 });
+    assert.deepStrictEqual(chooseBest({}, cands), { best: null, ok: 0 });
+  });
+
+  // ---------------- проба через SOCKS5 + TLS (локальные серверы, самоподписанный сертификат)
+  let tls = null;
+  try {
+    const d = path.join(tmp, 'tls');
+    fs.mkdirSync(d);
+    execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', path.join(d, 'k.pem'), '-out', path.join(d, 'c.pem'),
+      '-days', '2', '-subj', '/CN=test.local', '-addext', 'subjectAltName=DNS:test.local'], { stdio: 'ignore' });
+    tls = { key: fs.readFileSync(path.join(d, 'k.pem')), cert: fs.readFileSync(path.join(d, 'c.pem')) };
+  } catch (e) {
+    results.push('SKIP проба SOCKS5+TLS (нет openssl): ' + e.message);
+  }
+  if (tls) {
+    const servers = [];
+    const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+    const big = https.createServer(tls, (q, s) => s.end('x'.repeat(60000)));
+    const small = https.createServer(tls, (q, s) => s.end('ok'));
+    const freeze = https.createServer(tls, (q, s) => {
+      s.writeHead(200, { 'Content-Length': 100000 });
+      s.write('x'.repeat(16000)); // и дальше молчит, как при блокировке после первых килобайт
+    });
+    const reset = https.createServer(tls, (q, s) => q.socket.destroy());
+    // замедление: поток идёт, но ~10 КБ/с (как при троттлинге YouTube): рукопожатие и первые байты проходят
+    const slow = https.createServer(tls, (q, s) => {
+      s.writeHead(200, { 'Content-Length': 400000 });
+      const t = setInterval(() => s.write('x'.repeat(1000)), 100);
+      s.on('close', () => clearInterval(t));
+    });
+    const ports = {};
+    for (const [name, srv] of Object.entries({ big, small, freeze, reset, slow })) {
+      ports[name] = await listen(srv);
+      servers.push(srv);
+    }
+    // простейший SOCKS5: принимает имя домена, подключается к локальному порту из запроса
+    const socks = net.createServer((c) => {
+      c.once('data', () => {
+        c.write(Buffer.from([5, 0]));
+        c.once('data', (req) => {
+          const port = req.readUInt16BE(req.length - 2);
+          const up = net.connect(port, '127.0.0.1', () => {
+            c.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+            c.pipe(up);
+            up.pipe(c);
+          });
+          up.on('error', () => c.destroy());
+          c.on('error', () => up.destroy());
+        });
+      });
+    });
+    const socksPort = await listen(socks);
+    const opts = (n) => ({ destPort: ports[n], tls: { ca: tls.cert } });
+    await test('проба: большая страница доходит (успех)', async () => assert.strictEqual(await probeHost('test.local', socksPort, 3000, opts('big')), true));
+    await test('проба: короткая страница дочитана до конца (успех)', async () => assert.strictEqual(await probeHost('test.local', socksPort, 3000, opts('small')), true));
+    await test('проба: поток замерзает после 16 КБ (неуспех)', async () => assert.strictEqual(await probeHost('test.local', socksPort, 1500, opts('freeze')), false));
+    await test('проба: медленный поток без лимита проходит, с порогом скорости нет (замедление)', async () => {
+      const o = opts('slow');
+      assert.strictEqual(await probeHost('test.local', socksPort, 4000, { ...o, minBytes: 20000 }), true, 'без бюджета: 20 КБ набираются');
+      assert.strictEqual(await probeHost('test.local', socksPort, 4000, { ...o, minBytes: 60000, budgetMs: 1500 }), false, 'с бюджетом: 60 КБ за 1,5 с не успевают');
+      assert.strictEqual(await probeHost('test.local', socksPort, 3000, { ...opts('big'), minBytes: 60000, budgetMs: 1500 }), true, 'быстрый поток проходит бюджет');
+    });
+    await test('проба: соединение сброшено (неуспех)', async () => assert.strictEqual(await probeHost('test.local', socksPort, 1500, opts('reset')), false));
+    await test('проба: чужой сертификат отклоняется', async () => assert.strictEqual(await probeHost('test.local', socksPort, 1500, { destPort: ports.big }), false));
+    socks.close();
+    servers.forEach((s) => s.close());
+  }
+
+  // ---------------- движок на настоящем процессе ByeDPI (если есть собранный для этой ОС)
+  const bin = process.env.WT_TEST_CIADPI;
+  if (bin && fs.existsSync(bin)) {
+    const resDir = path.join(tmp, 'res');
+    fs.mkdirSync(path.join(resDir, 'bin', process.platform), { recursive: true });
+    fs.copyFileSync(bin, path.join(resDir, 'bin', process.platform, process.platform === 'win32' ? 'ciadpi.exe' : 'ciadpi'));
+    fs.chmodSync(path.join(resDir, 'bin', process.platform, 'ciadpi'), 0o755);
+    const store = new Store(path.join(tmp, 'eng'));
+    store.set('enabled', ['youtube']);
+    store.set('strategy_youtube', 'split+disorder');
+    store.set('socksPort', await freePort());
+    const engine = new Engine({ resourcesDir: resDir, store, config });
+    const logs = [];
+    engine.on('log', (l) => logs.push(l));
+    await test('движок: запуск, PAC обновляется, остановка', async () => {
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      assert(engine.running);
+      const pac = engine.pac.content;
+      assert(pac.includes('youtube.com') && !pac.includes('instagram.com'));
+      await engine.stop();
+      assert(!engine.running);
+      assert(!engine.pac.content.includes('youtube.com'), 'после остановки все адреса идут напрямую');
+    });
+    await test('движок: повторный запуск на том же порту после остановки', async () => {
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      await engine.stop();
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      await engine.stop();
+    });
+    await test('движок: занятый порт не ломает запуск (берётся свободный)', async () => {
+      const busy = net.createServer();
+      const p = await new Promise((r) => busy.listen(0, '127.0.0.1', () => r(busy.address().port)));
+      store.set('socksPort', p);
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      assert.notStrictEqual(engine.socksPort, p);
+      await engine.stop();
+      busy.close();
+    });
+    await test('движок: WhatsApp (match_all) среди нескольких сервисов получает отдельный ByeDPI без фильтра', async () => {
+      store.set('enabled', ['youtube', 'instagram', 'whatsapp']);
+      store.set('strategy_whatsapp', 'disorder0');
+      logs.length = 0;
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      const startLines = logs.filter((l) => l.includes('Запуск ByeDPI'));
+      assert.strictEqual(startLines.length, 2, startLines.join('\n'));
+      const main = startLines.find((l) => !l.includes('(WhatsApp)'));
+      const wa = startLines.find((l) => l.includes('(WhatsApp)'));
+      assert(main.includes('--hosts') && !main.includes('whatsapp.com'), 'в основном ByeDPI нет группы WhatsApp');
+      assert(wa && !wa.includes('--hosts'), 'отдельный ByeDPI для WhatsApp работает без фильтра по SNI');
+      assert.strictEqual(engine.extra.length, 1);
+      await engine.stop();
+      assert.strictEqual(engine.extra.length, 0, 'после остановки отдельные процессы закрыты');
+      store.set('enabled', ['whatsapp']);
+      logs.length = 0;
+      assert.strictEqual(await engine.start(), true, logs.join('\n'));
+      assert.strictEqual(engine.extra.length, 0, 'один сервис: как раньше, один ByeDPI без фильтра');
+      await engine.stop();
+    });
+    await engine.shutdown();
+  } else {
+    results.push('SKIP движок с реальным ByeDPI (задайте WT_TEST_CIADPI=путь к ciadpi)');
+  }
+
+  await test('DNS-переходник: разбор ответа DoH и кэш', async () => {
+    assert.deepStrictEqual(
+      parseDohAnswer({ Status: 0, Answer: [{ type: 5, data: 'x.' }, { type: 1, TTL: 120, data: '1.2.3.4' }, { type: 1, TTL: 30, data: '5.6.7.8' }] }),
+      { ips: ['1.2.3.4', '5.6.7.8'], ttl: 30 }
+    );
+    assert.deepStrictEqual(parseDohAnswer({ Status: 3 }), { ips: [], ttl: 0 });
+    let calls = 0;
+    const doh = async () => (calls++, { ips: ['9.9.9.9'], ttl: 60 });
+    assert.deepStrictEqual(await resolve4('cache-test.example', doh), ['9.9.9.9']);
+    assert.deepStrictEqual(await resolve4('cache-test.example', doh), ['9.9.9.9']);
+    assert.strictEqual(calls, 1);
+    assert.deepStrictEqual(await resolve4('127.0.0.1', doh), ['127.0.0.1']);
+  });
+
+  await test('DNS-переходник: домен определяется сам и уходит в ByeDPI уже адресом', async () => {
+    // поддельный "ByeDPI": принимает SOCKS5 и запоминает, какой тип адреса ему прислали
+    let seenAtyp = null;
+    const fake = net.createServer((s) => {
+      s.once('data', () => {
+        s.write(Buffer.from([5, 0]));
+        s.once('data', (d) => {
+          seenAtyp = d[3];
+          s.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+          s.on('data', (x) => s.write(Buffer.concat([Buffer.from('ok:'), x])));
+        });
+      });
+    });
+    await new Promise((r) => fake.listen(0, '127.0.0.1', r));
+    const front = new DohSocks({ upstreamPort: fake.address().port, doh: async () => ({ ips: ['127.0.0.1'], ttl: 60 }) });
+    await front.start();
+    const answer = await new Promise((resolve, reject) => {
+      const c = net.connect(front.port, '127.0.0.1');
+      let st = 0;
+      c.on('connect', () => c.write(Buffer.from([5, 1, 0])));
+      c.on('data', (d) => {
+        if (st === 0) {
+          st = 1;
+          const h = Buffer.from('studio.youtube.com');
+          c.write(Buffer.concat([Buffer.from([5, 1, 0, 3, h.length]), h, Buffer.from([1, 187])]));
+        } else if (st === 1) {
+          st = 2;
+          assert.strictEqual(d[1], 0);
+          c.write('hi');
+        } else {
+          resolve(d.toString());
+          c.destroy();
+        }
+      });
+      c.on('error', reject);
+      setTimeout(() => reject(new Error('таймаут')), 4000);
+    });
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.strictEqual(seenAtyp, 1, 'в ByeDPI должен прийти IPv4-адрес, а не имя');
+  });
+
+  // поддельный ByeDPI: на "закрытые" адреса не отвечает вообще (как блокировка по IP), на остальные отвечает эхом
+  const fakeSocksUpstream = async (blockedIps, seen) => {
+    const srv = net.createServer((s) => {
+      s.on('error', () => {});
+      s.once('data', () => {
+        s.write(Buffer.from([5, 0]));
+        s.once('data', (d) => {
+          const ip = [...d.subarray(4, 8)].join('.');
+          seen.push(ip);
+          if (blockedIps.includes(ip)) return; // молчим: соединение "висит"
+          s.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+          s.on('data', (x) => s.write(Buffer.concat([Buffer.from('ok:'), x])));
+        });
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    return srv;
+  };
+  const viaFront = (front, host) =>
+    new Promise((resolve, reject) => {
+      const c = net.connect(front.port, '127.0.0.1');
+      let st = 0;
+      c.on('connect', () => c.write(Buffer.from([5, 1, 0])));
+      c.on('data', (d) => {
+        if (st === 0) {
+          st = 1;
+          const h = Buffer.from(host);
+          c.write(Buffer.concat([Buffer.from([5, 1, 0, 3, h.length]), h, Buffer.from([1, 187])]));
+        } else if (st === 1) {
+          st = 2;
+          if (d[1] !== 0) return resolve('fail:' + d[1]), c.destroy();
+          c.write('hi');
+        } else {
+          resolve(d.toString());
+          c.destroy();
+        }
+      });
+      c.on('error', reject);
+      setTimeout(() => reject(new Error('таймаут теста')), 6000);
+    });
+
+  await test('DNS-переходник: закрытый провайдером адрес пропускается, берётся рабочий', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.7'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      doh: async () => ({ ips: ['203.0.113.7', '127.0.0.1'], ttl: 60 }),
+    });
+    await front.start();
+    const t0 = Date.now();
+    const answer = await viaFront(front, 'blocked-first.example');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.ok(Date.now() - t0 < 3000);
+    assert.deepStrictEqual(seen.slice(0, 2), ['203.0.113.7', '127.0.0.1']);
+  });
+
+  await test('DNS-переходник: если адреса www закрыты, берутся адреса соседнего хоста Instagram', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.8'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      doh: async (name) => {
+        if (name === 'www.instagram.com') return { ips: ['203.0.113.8'], ttl: 60 };
+        if (name === 'i.instagram.com') return { ips: ['127.0.0.1'], ttl: 60 };
+        throw new Error('нет');
+      },
+    });
+    await front.start();
+    const answer = await viaFront(front, 'www.instagram.com');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.ok(seen.includes('127.0.0.1'));
+  });
+
+  await test('DNS-переходник: закрытый адрес web.whatsapp.com заменяется рабочим адресом Meta', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.9'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      doh: async (name) => {
+        if (name === 'site-a.whatsapp.com') return { ips: ['203.0.113.9'], ttl: 60 };
+        if (name === 'i.instagram.com') return { ips: ['127.0.0.1'], ttl: 60 };
+        throw new Error('нет');
+      },
+    });
+    await front.start();
+    const answer = await viaFront(front, 'site-a.whatsapp.com');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'ok:hi');
+    assert.ok(seen.includes('127.0.0.1'));
+  });
+
+  await test('DNS-переходник: чат WhatsApp (g.whatsapp.net) не получает чужие адреса Meta', async () => {
+    const seen = [];
+    const fake = await fakeSocksUpstream(['203.0.113.10'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      connectTimeoutMs: 400,
+      doh: async (name) => (name === 'chat-a.whatsapp.net' ? { ips: ['203.0.113.10'], ttl: 60 } : { ips: ['127.0.0.1'], ttl: 60 }),
+    });
+    await front.start();
+    const answer = await viaFront(front, 'chat-a.whatsapp.net');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'fail:5');
+    assert.deepStrictEqual(seen, ['203.0.113.10']);
+  });
+
+  // поддельный ByeDPI: соединение с "молчащими" адресами принимает, но на запрос не отвечает (как обрыв после ClientHello)
+  const fakeSilentUpstream = async (silentIps, seen) => {
+    const srv = net.createServer((s) => {
+      s.on('error', () => {});
+      s.once('data', () => {
+        s.write(Buffer.from([5, 0]));
+        s.once('data', (d) => {
+          const ip = [...d.subarray(4, 8)].join('.');
+          seen.push(ip);
+          s.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]));
+          if (silentIps.includes(ip)) return s.on('data', () => {}); // принимаем и молчим
+          s.on('data', (x) => s.write(Buffer.concat([Buffer.from('ok:'), x])));
+        });
+      });
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    return srv;
+  };
+  // клиент шлёт заготовку TLS ClientHello; возвращает ответ или 'closed', если соединение закрыли без ответа
+  const viaFrontTls = (front, host) =>
+    new Promise((resolve, reject) => {
+      const c = net.connect(front.port, '127.0.0.1');
+      let st = 0;
+      c.on('connect', () => c.write(Buffer.from([5, 1, 0])));
+      c.on('data', (d) => {
+        if (st === 0) {
+          st = 1;
+          const h = Buffer.from(host);
+          c.write(Buffer.concat([Buffer.from([5, 1, 0, 3, h.length]), h, Buffer.from([1, 187])]));
+        } else if (st === 1) {
+          st = 2;
+          if (d[1] !== 0) return resolve('fail:' + d[1]), c.destroy();
+          c.write(Buffer.from([0x16, 0x03, 0x01, 0x00, 0x05, 1, 2, 3, 4, 5]));
+        } else {
+          resolve(d.toString().replace(/[^ -~]/g, '.'));
+          c.destroy();
+        }
+      });
+      c.on('close', () => resolve('closed'));
+      c.on('error', reject);
+      setTimeout(() => reject(new Error('таймаут теста')), 8000);
+    });
+
+  await test('DNS-переходник: сервер принял соединение, но молчит на ClientHello: запрос повторяется на другом адресе', async () => {
+    const seen = [];
+    const fake = await fakeSilentUpstream(['203.0.113.31'], seen);
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      firstByteMs: 400,
+      doh: async () => ({ ips: ['203.0.113.31', '127.0.0.1'], ttl: 60 }),
+    });
+    await front.start();
+    const t0 = Date.now();
+    const answer = await viaFrontTls(front, 'silent-first.example');
+    await front.stop();
+    fake.close();
+    assert.ok(answer.startsWith('ok:'), answer);
+    assert.ok(Date.now() - t0 < 4000);
+    assert.deepStrictEqual(seen, ['203.0.113.31', '127.0.0.1']);
+  });
+
+  await test('DNS-переходник: единственный адрес молчит: соединение закрывается быстро, а не висит', async () => {
+    const seen = [];
+    const fake = await fakeSilentUpstream(['203.0.113.32'], seen);
+    const logs = [];
+    const front = new DohSocks({
+      upstreamPort: fake.address().port,
+      staggerMs: 100,
+      firstByteMs: 400,
+      log: (m) => logs.push(m),
+      doh: async () => ({ ips: ['203.0.113.32'], ttl: 60 }),
+    });
+    await front.start();
+    const t0 = Date.now();
+    const answer = await viaFrontTls(front, 'silent-only.example');
+    await front.stop();
+    fake.close();
+    assert.strictEqual(answer, 'closed');
+    assert.ok(Date.now() - t0 < 3000, 'закрыто быстро');
+    assert.ok(logs.some((l) => l.startsWith('Сервер не ответил на запрос')), logs.join('\n'));
+  });
+
+  await test('DNS-переходник: домены сервиса без SNI уходят в отдельный ByeDPI, остальные в основной', async () => {
+    const seenMain = [];
+    const seenWa = [];
+    const main = await fakeSocksUpstream([], seenMain);
+    const wa = await fakeSocksUpstream([], seenWa);
+    const front = new DohSocks({
+      upstreamPort: main.address().port,
+      routes: [{ name: 'WhatsApp', domains: ['whatsapp.com', 'whatsapp.net'], port: wa.address().port }],
+      doh: async (name) => ({ ips: [/\.whatsapp\.(net|com)$/.test(name) ? '127.0.0.1' : '127.0.0.2'], ttl: 60 }),
+    });
+    await front.start();
+    assert.strictEqual(await viaFront(front, 'route-a.whatsapp.net'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'route-b.whatsapp.com'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'www.example.org'), 'ok:hi');
+    assert.strictEqual(await viaFront(front, 'notwhatsapp.com'), 'ok:hi'); // похожее имя не должно попасть в маршрут
+    await front.stop();
+    main.close();
+    wa.close();
+    assert.deepStrictEqual(seenWa, ['127.0.0.1', '127.0.0.1']);
+    assert.deepStrictEqual(seenMain, ['127.0.0.2', '127.0.0.2']);
+  });
+
+  await test('автоподбор: среди равных по числу успехов выигрывает более быстрый путь, остальные остаются в списке', async () => {
+    const candidates = ['none', 'a', 'b', 'c', 'd'];
+    const stats = {
+      a: { ok: 4, latencySum: 4 * 900, kbpsSum: 4 * 100 }, // полный балл, но медленный
+      b: { ok: 4, latencySum: 4 * 200, kbpsSum: 4 * 400 }, // полный балл и быстрый: лучший
+      c: { ok: 2, latencySum: 2 * 100, kbpsSum: 2 * 900 }, // быстрый, но открылось меньше адресов
+      d: { ok: 0, latencySum: 0, kbpsSum: 0 }, // не открылся: в список не попадает
+    };
+    const r = autoprobeMod.rank(stats, candidates, 4);
+    assert.deepStrictEqual(r.map((x) => x.strategy), ['b', 'a', 'c']);
+    assert.deepStrictEqual(r[0], { strategy: 'b', ok: 4, total: 4, latencyMs: 200, kbps: 400 });
+    // при полном равенстве скорости выигрывает более ранний в списке
+    const eq = { a: { ok: 3, latencySum: 300, kbpsSum: 300 }, b: { ok: 3, latencySum: 300, kbpsSum: 300 } };
+    assert.deepStrictEqual(autoprobeMod.rank(eq, ['none', 'a', 'b'], 4).map((x) => x.strategy), ['a', 'b']);
+    assert.deepStrictEqual(autoprobeMod.rank({}, candidates, 4), []);
+  });
+
+  console.log(results.join('\n'));
+  console.log(`\nПройдено проверок: ${passed}${process.exitCode ? ', ЕСТЬ ОШИБКИ' : ''}`);
+  fs.rmSync(tmp, { recursive: true, force: true });
+  process.exit(process.exitCode || 0);
+})();

@@ -1,0 +1,133 @@
+{
+  "version": 7,
+  "strategies": [
+    "split+disorder",
+    "disorder",
+    "split",
+    "tlsrec",
+    "split+tlsrec",
+    "disorder+tlsrec",
+    "oob",
+    "disoob",
+    "chain",
+    "chain-oob",
+    "chain-mix",
+    "chain-mix2",
+    "chain-dis",
+    "chain-tlsrec",
+    "chain-fine",
+    "oob-rec-split",
+    "fake+disorder",
+    "fake+split",
+    "fake+oob",
+    "fake+tlsrec",
+    "fake3+disorder",
+    "fake4+disorder",
+    "fake6+disorder",
+    "fake12+disorder",
+    "chain-fake",
+    "oob-sack",
+    "disorder0",
+    "split0",
+    "chain+udp",
+    "disorder0+udp",
+    "split+udp",
+    "disorder+udp"
+  ],
+  "profiles": [
+    {
+      "id": "youtube",
+      "name": "YouTube",
+      "android_packages": [
+        "com.google.android.youtube",
+        "com.google.android.apps.youtube.music",
+        "com.google.android.apps.youtube.mango",
+        "com.google.android.apps.youtube.creator",
+        "app.revanced.android.youtube",
+        "app.revanced.android.apps.youtube.music"
+      ],
+      "domains": [
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "youtubekids.com",
+        "googlevideo.com",
+        "ytimg.com",
+        "ggpht.com",
+        "yt3.googleusercontent.com",
+        "youtubei.googleapis.com",
+        "youtube.googleapis.com",
+        "jnn-pa.googleapis.com"
+      ],
+      "probe_hosts": [
+        "www.youtube.com",
+        "i.ytimg.com",
+        "redirector.googlevideo.com",
+        "youtubei.googleapis.com"
+      ],
+      "probe_min_bytes": 100000,
+      "probe_budget_ms": 4000,
+      "block_quic": true,
+      "match_all": false,
+      "default_enabled": true,
+      "default_strategy": "split+disorder"
+    },
+    {
+      "id": "instagram",
+      "name": "Instagram",
+      "android_packages": [
+        "com.instagram.android",
+        "com.instagram.lite"
+      ],
+      "domains": [
+        "instagram.com",
+        "cdninstagram.com",
+        "instagr.am",
+        "ig.me",
+        "fbcdn.net",
+        "facebook.com",
+        "facebook.net",
+        "fb.com",
+        "fbsbx.com"
+      ],
+      "probe_hosts": [
+        "www.instagram.com",
+        "i.instagram.com",
+        "graph.instagram.com",
+        "scontent.cdninstagram.com",
+        "static.cdninstagram.com"
+      ],
+      "block_quic": true,
+      "match_all": false,
+      "default_enabled": true,
+      "default_strategy": "split+disorder"
+    },
+    {
+      "id": "whatsapp",
+      "name": "WhatsApp",
+      "android_packages": [
+        "com.whatsapp",
+        "com.whatsapp.w4b"
+      ],
+      "domains": [
+        "whatsapp.com",
+        "whatsapp.net",
+        "wa.me"
+      ],
+      "probe_hosts": [
+        "web.whatsapp.com",
+        "www.whatsapp.com",
+        "static.whatsapp.net"
+      ],
+      "block_quic": false,
+      "match_all": true,
+      "default_enabled": false,
+      "default_strategy": "disorder0",
+      "strategy_options": [
+        "disorder0",
+        "split0",
+        "chain"
+      ]
+    }
+  ]
+}

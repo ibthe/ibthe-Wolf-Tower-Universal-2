@@ -1,0 +1,368 @@
+const { spawn, execFileSync } = require('child_process');
+const EventEmitter = require('events');
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+const { buildGroups, enabledIds, supported, BASE, forName } = require('./profiles');
+const { PacServer } = require('./pac');
+const { DohSocks } = require('./dohsocks');
+const sysproxy = require('./sysproxy');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function binaryPath(resourcesDir) {
+  const name = process.platform === 'win32' ? 'ciadpi.exe' : 'ciadpi';
+  return path.join(resourcesDir, 'bin', process.platform, name);
+}
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const s = net.createServer();
+    s.once('error', reject);
+    s.listen(0, '127.0.0.1', () => {
+      const p = s.address().port;
+      s.close(() => resolve(p));
+    });
+  });
+}
+
+function canListen(port) {
+  return new Promise((resolve) => {
+    const s = net.createServer();
+    s.once('error', () => resolve(false));
+    s.listen(port, '127.0.0.1', () => s.close(() => resolve(true)));
+  });
+}
+
+function canConnect(port) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: '127.0.0.1', port });
+    const finish = (ok) => {
+      s.destroy();
+      resolve(ok);
+    };
+    s.setTimeout(150, () => finish(false));
+    s.once('connect', () => finish(true));
+    s.once('error', () => finish(false));
+  });
+}
+
+/** Один процесс ByeDPI (SOCKS5 на localhost). */
+class ByeDpi extends EventEmitter {
+  constructor(bin) {
+    super();
+    this.bin = bin;
+    this.proc = null;
+    this.exited = true;
+    this.exitCode = null;
+    this.lastError = ''; // причина последнего неудачного запуска (для сообщения пользователю)
+    this.recent = [];
+  }
+
+  /** macOS/Linux: бинарник мог потерять бит исполнения, а на macOS ещё получить карантин после скачивания. */
+  prepareBinary() {
+    if (process.platform === 'win32') return;
+    try {
+      fs.chmodSync(this.bin, 0o755);
+    } catch (_) {
+      /* ignore */
+    }
+    if (process.platform === 'darwin') {
+      try {
+        execFileSync('xattr', ['-d', 'com.apple.quarantine', this.bin], { stdio: 'ignore' });
+      } catch (_) {
+        /* атрибута нет: это нормально */
+      }
+    }
+  }
+
+  /** true только если процесс жив и порт принимает соединения. */
+  async start(port, args, signedRetry = false) {
+    if (!fs.existsSync(this.bin)) {
+      this.lastError = `не найден файл ${this.bin}`;
+      this.emit('log', `Не найден ${this.bin}`);
+      return false;
+    }
+    this.prepareBinary();
+    this.recent = [];
+    this.emit('log', `Запуск ByeDPI на порту ${port}: ${args.join(' ')}`);
+    let proc;
+    try {
+      proc = spawn(this.bin, ['-i', '127.0.0.1', '-p', String(port), ...args], { windowsHide: true });
+    } catch (e) {
+      this.lastError = e.message;
+      this.emit('log', `Ошибка запуска: ${e.message}`);
+      return false;
+    }
+    this.proc = proc;
+    this.exited = false;
+    this.exitCode = null;
+    const onData = (d) =>
+      String(d)
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .forEach((l) => {
+          this.recent = [...this.recent.slice(-2), l];
+          this.emit('log', l);
+        });
+    proc.stdout.on('data', onData);
+    proc.stderr.on('data', onData);
+    proc.on('error', (e) => {
+      this.exited = true;
+      this.lastError = e.code === 'EACCES' ? 'нет права запускать ciadpi (chmod +x)' : e.message;
+      this.emit('log', `Ошибка процесса: ${e.message}`);
+    });
+    proc.on('exit', (code, signal) => {
+      this.exited = true;
+      this.exitCode = code;
+      this.exitSignal = signal;
+      this.emit('exit', code);
+    });
+
+    const deadline = Date.now() + 2500;
+    while (Date.now() < deadline) {
+      if (this.exited) {
+        // macOS убивает бинарник без подписи сигналом (код null): подписываем ad hoc и пробуем один раз ещё
+        if (process.platform === 'darwin' && !signedRetry && this.exitSignal && this.exitSignal !== 'SIGTERM') {
+          try {
+            execFileSync('codesign', ['--force', '--sign', '-', this.bin], { stdio: 'ignore' });
+            this.emit('log', `ByeDPI был остановлен системой (${this.exitSignal}): бинарник подписан ad hoc, повтор`);
+            return await this.start(port, args, true);
+          } catch (_) {
+            /* codesign недоступен: сообщаем причину ниже */
+          }
+        }
+        const why = this.exitSignal ? `сигнал ${this.exitSignal}` : `код ${this.exitCode}`;
+        this.lastError = `процесс завершился сразу (${why})` + (this.recent.length ? `: ${this.recent.join(' | ')}` : '');
+        this.emit('log', `ByeDPI завершился сразу после запуска (${why}): порт занят, неверные параметры или система не разрешила запуск`);
+        return false;
+      }
+      if (await canConnect(port)) return true;
+      await sleep(80);
+    }
+    this.lastError = `не открыл порт ${port} за 2,5 с`;
+    this.emit('log', `ByeDPI не открыл порт ${port} за 2,5 с`);
+    await this.stop();
+    return false;
+  }
+
+  /** Мягкая остановка, затем принудительная: иначе старый процесс может держать порт. */
+  async stop() {
+    const p = this.proc;
+    if (!p) return;
+    this.proc = null;
+    if (this.exited) return;
+    const exited = new Promise((resolve) => p.once('exit', resolve));
+    try {
+      p.kill();
+    } catch (_) {
+      /* ignore */
+    }
+    const ok = await Promise.race([exited.then(() => true), sleep(700).then(() => false)]);
+    if (!ok) {
+      try {
+        p.kill('SIGKILL');
+      } catch (_) {
+        /* ignore */
+      }
+      await Promise.race([exited, sleep(1000)]);
+    }
+  }
+}
+
+/** Защита: ByeDPI + PAC-сервер + системная автонастройка прокси. */
+class Engine extends EventEmitter {
+  constructor({ resourcesDir, store, config }) {
+    super();
+    this.bin = binaryPath(resourcesDir);
+    this.store = store;
+    this.config = config;
+    this.pac = new PacServer();
+    this.bye = null;
+    this.front = null; // SOCKS5-переходник с DNS-over-HTTPS перед ByeDPI
+    this.extra = []; // отдельные ByeDPI для сервисов без SNI (match_all), когда включено несколько сервисов
+    this.running = false;
+    this.socksPort = 0;
+  }
+
+  log(msg) {
+    this.emit('log', msg);
+  }
+
+  /** Включённые сервисы (выбор пользователя; по умолчанию все). */
+  enabledIds() {
+    return enabledIds(this.config, this.store);
+  }
+
+  strategyFor(profile) {
+    const saved = this.store.get('strategy_' + profile.id, profile.defaultStrategy || this.config.defaultStrategy);
+    return profile.strategyOptions.length && !profile.strategyOptions.includes(saved) && !saved.startsWith('raw:')
+      ? profile.defaultStrategy || this.config.defaultStrategy
+      : saved;
+  }
+
+  selection() {
+    const ids = this.enabledIds();
+    return this.config.profiles
+      .filter((p) => ids.includes(p.id))
+      .map((profile) => {
+        let strategy = this.strategyFor(profile);
+        if (!supported(strategy)) {
+          this.log(`Стратегия ${strategy} не поддерживается на этой ОС, используется ${this.config.defaultStrategy}`);
+          strategy = profile.defaultStrategy || this.config.defaultStrategy;
+        }
+        return { profile, strategy };
+      });
+  }
+
+  async start() {
+    if (this.running) return true;
+    const sel = this.selection();
+    if (!sel.length) {
+      this.log('Не выбран ни один сервис');
+      return false;
+    }
+    this.log('Стратегии: ' + sel.map((s) => `${s.profile.name}=${s.strategy}`).join(', '));
+    // Сервисы match_all (чат WhatsApp идёт по Noise без SNI) не может поймать фильтр --hosts: он смотрит только на SNI.
+    // Когда включено несколько сервисов, такому сервису нужен свой ByeDPI без фильтра; переходник направляет в него
+    // домены сервиса по имени (имя известно до подключения, в отличие от трафика без SNI).
+    const activeSel = sel.filter((s) => s.strategy !== 'none');
+    const dedicated = activeSel.length > 1 ? activeSel.filter((s) => s.profile.matchAll) : [];
+    const args = buildGroups(sel.filter((s) => !dedicated.includes(s)));
+
+    const preferred = this.store.get('socksPort', 18080);
+    const port = (await canListen(preferred)) ? preferred : await freePort();
+    if (port !== preferred) this.log(`Порт ${preferred} занят, используется ${port}`);
+
+    const bye = new ByeDpi(this.bin);
+    bye.on('log', (l) => this.log('byedpi: ' + l));
+    if (!(await bye.start(port, [...BASE, ...args]))) return false;
+    this.bye = bye;
+
+    const routes = [];
+    for (const d of dedicated) {
+      const dport = await freePort();
+      const extra = new ByeDpi(this.bin);
+      extra.on('log', (l) => this.log(`byedpi (${d.profile.name}): ` + l));
+      if (!(await extra.start(dport, [...BASE, ...forName(d.strategy)]))) {
+        this.log(`Не удалось запустить отдельный ByeDPI для ${d.profile.name}`);
+        await this.stopExtras();
+        await bye.stop();
+        this.bye = null;
+        return false;
+      }
+      this.extra.push(extra);
+      routes.push({ name: d.profile.name, domains: d.profile.domains.map((x) => x.toLowerCase()), port: dport });
+    }
+
+    // Браузер ходит не прямо в ByeDPI, а через переходник: он сам определяет адрес домена через DNS-over-HTTPS.
+    // Системный DNS провайдера часто режет или подменяет адреса (в журнале: "byedpi: not resolved: ..."), а ByeDPI
+    // использует именно его.
+    const front = new DohSocks({ upstreamPort: port, routes, log: (m) => this.log(m) });
+    try {
+      await front.start();
+    } catch (e) {
+      this.log('Не удалось запустить DNS-переходник: ' + e.message);
+      await this.stopExtras();
+      await bye.stop();
+      this.bye = null;
+      return false;
+    }
+    this.front = front;
+    this.socksPort = front.port;
+
+    try {
+      await this.pac.start();
+      this.pac.update(sel.flatMap((s) => s.profile.domains), front.port);
+      // Ставим PAC не по флагу, а по факту: порт PAC-сервера меняется при каждом запуске программы, а настройки
+      // системы могли остаться от прошлого сеанса или быть не применены (отменён запрос пароля).
+      let state = await sysproxy.check(this.pac.url);
+      if (!state.ok) {
+        await sysproxy.install(this.pac.url, this.store, (m) => this.log(m));
+        state = await sysproxy.check(this.pac.url);
+      }
+      if (!state.ok) throw new Error('система не приняла настройку прокси (' + state.detail + ')');
+      this.log('Системный прокси: PAC ' + this.pac.url + ' активен');
+    } catch (e) {
+      this.log('Не удалось настроить системный прокси: ' + e.message);
+      this.pac.update([], 0);
+      await this.stopFront();
+      await this.stopExtras();
+      await bye.stop();
+      this.bye = null;
+      return false;
+    }
+
+    for (const x of this.extra) {
+      x.on('exit', () => {
+        if (this.running && this.bye === bye) {
+          this.log('Отдельный ByeDPI остановился неожиданно, защита выключена');
+          this.running = false;
+          this.pac.update([], 0);
+          this.stopFront();
+          this.stopExtras();
+          bye.stop();
+          this.bye = null;
+          this.emit('changed');
+        }
+      });
+    }
+
+    bye.on('exit', () => {
+      if (this.bye === bye && this.running) {
+        this.log('ByeDPI остановился неожиданно, защита выключена');
+        this.running = false;
+        this.pac.update([], 0);
+        this.stopFront();
+        this.stopExtras();
+        this.bye = null;
+        this.emit('changed');
+      }
+    });
+    this.running = true;
+    this.log(`Защита включена. SOCKS5 127.0.0.1:${front.port} (DNS через DoH) -> ByeDPI :${port}`);
+    this.emit('changed');
+    return true;
+  }
+
+  async stopExtras() {
+    const list = this.extra;
+    this.extra = [];
+    await Promise.all(list.map((x) => x.stop().catch(() => {})));
+  }
+
+  async stopFront() {
+    const f = this.front;
+    this.front = null;
+    if (f) await f.stop().catch(() => {});
+  }
+
+  /** Выключает защиту. Системная настройка PAC остаётся, но отдаёт "напрямую" для всех адресов. */
+  async stop() {
+    const wasRunning = this.running || this.bye;
+    this.running = false;
+    this.pac.update([], 0);
+    await this.stopFront();
+    await this.stopExtras();
+    if (this.bye) {
+      const b = this.bye;
+      this.bye = null;
+      await b.stop();
+    }
+    if (wasRunning) this.log('Защита выключена');
+    this.emit('changed');
+  }
+
+  /** Полное завершение: остановка, возврат системных настроек, закрытие PAC-сервера. */
+  async shutdown() {
+    await this.stop();
+    try {
+      await sysproxy.restore(this.store, (m) => this.log(m));
+    } catch (e) {
+      this.log('Не удалось вернуть системные настройки прокси: ' + e.message);
+    }
+    await this.pac.stop();
+  }
+}
+
+module.exports = { Engine, ByeDpi, binaryPath, freePort, canListen };
